@@ -51,6 +51,8 @@
  *   RegisterCmd ReadHolding
  *   RegisterType float
  *   Type gauge
+ *   Endianness big
+ *   Mask 0b100
  *   Instance "..."
  * </Data>
  *
@@ -81,7 +83,9 @@ enum mb_register_type_e /* {{{ */
   REG_TYPE_FLOAT }; /* }}} */
 enum mb_mreg_type_e /* {{{ */
 { MREG_HOLDING,
-  MREG_INPUT }; /* }}} */
+  MREG_INPUT,
+  MREG_COIL,
+  MREG_DISCRETE_INPUT }; /* }}} */
 typedef enum mb_register_type_e mb_register_type_t;
 typedef enum mb_mreg_type_e mb_mreg_type_t;
 
@@ -99,6 +103,8 @@ struct mb_data_s /* {{{ */
   int register_base;
   mb_register_type_t register_type;
   mb_mreg_type_t modbus_register_type;
+  mb_endianness_t endianness;
+  long mask;
   char type[DATA_MAX_NAME_LEN];
   char instance[DATA_MAX_NAME_LEN];
 
@@ -338,6 +344,7 @@ static int mb_init_connection(mb_host_t *host) /* {{{ */
 static int mb_init_connection(mb_host_t *host) /* {{{ */
 {
   int status;
+  struct timeval response_timeout;
 
   if (host == NULL)
     return (EINVAL);
@@ -367,6 +374,10 @@ static int mb_init_connection(mb_host_t *host) /* {{{ */
       return (-1);
     }
   }
+
+  response_timeout.tv_sec = 30;
+  response_timeout.tv_usec = 0;
+  modbus_set_response_timeout(host->connection, &response_timeout);
 
 #if COLLECT_DEBUG
   modbus_set_debug(host->connection, 1);
@@ -488,6 +499,18 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
                                          /* start_addr = */ data->register_base,
                                          /* num_registers = */ values_num,
                                          /* buffer = */ values);
+  } else if (data->modbus_register_type == MREG_COIL){
+    uint8_t coil_value;
+    status = modbus_read_bits (host->connection,
+        /* start_addr = */ data->register_base,
+        /* num_registers = */ values_num, /* buffer = */ &coil_value);
+    values[0] = (uint16_t) coil_value;
+  } else if (data->modbus_register_type == MREG_DISCRETE_INPUT){
+    uint8_t input_value;
+    status = modbus_read_input_bits (host->connection,
+        /* start_addr = */ data->register_base,
+        /* num_registers = */ values_num, /* buffer = */ &input_value);
+    values[0] = (uint16_t) input_value;
   } else {
     status = modbus_read_registers(host->connection,
                                    /* start_addr = */ data->register_base,
@@ -496,8 +519,8 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
   }
   if (status != values_num) {
     ERROR("Modbus plugin: modbus read function (%s/%s) failed. "
-          " status = %i, values_num = %i. Giving up.",
-          host->host, host->node, status, values_num);
+          " status = %i, values_num = %i, error = %s. Giving up.",
+          host->host, host->node, status, values_num, modbus_strerror(errno));
 #if LEGACY_LIBMODBUS
     modbus_close(&host->connection);
 #else
@@ -530,10 +553,15 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
     } v;
     value_t vt;
 
-    v.u32 = (((uint32_t)values[0]) << 16) | ((uint32_t)values[1]);
-    DEBUG("Modbus plugin: mb_read_data: "
-          "Returned int32 value is %" PRIi32,
-          v.i32);
+    if (data->endianness == ENDIAN_LITTLE) {
+      v.u32 = (((uint32_t) values[1]) << 16)
+        | ((uint32_t) values[0]);
+    } else {
+      v.u32 = (((uint32_t) values[0]) << 16)
+        | ((uint32_t) values[1]); 
+    }
+    DEBUG ("Modbus plugin: mb_read_data: "
+        "Returned int32 value is %"PRIi32, v.i32);
 
     CAST_TO_VALUE_T(ds, vt, v.i32);
     mb_submit(host, slave, data, vt);
@@ -571,8 +599,12 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
           "Returned uint16 value is %" PRIu16,
           values[0]);
 
-    CAST_TO_VALUE_T(ds, vt, values[0]);
-    mb_submit(host, slave, data, vt);
+    if (data->mask) {
+      values[0] = values[0] & data->mask; 
+    }
+    
+    CAST_TO_VALUE_T (ds, vt, values[0]);
+    mb_submit (host, slave, data, vt);
   }
 
   return (0);
@@ -587,8 +619,17 @@ static int mb_read_slave(mb_host_t *host, mb_slave_t *slave) /* {{{ */
     return (EINVAL);
 
   success = 0;
-  for (mb_data_t *data = slave->collect; data != NULL; data = data->next) {
-    status = mb_read_data(host, slave, data);
+  for (data = slave->collect; data != NULL; data = data->next) {
+    status = mb_read_data (host, slave, data);
+    if (status != 0) {
+      ERROR ("Modbus plugin: modbus_read_registers (%s/%s) failed. "
+        "Trying once more.", host->host, host->node);
+      status = mb_read_data (host, slave, data);
+      if (status != 0) {
+	    ERROR ("Modbus plugin: modbus_read_registers (%s/%s) failed. "
+           "Giving up.", host->host, host->node);
+      }
+    }
     if (status == 0)
       success++;
   }
@@ -678,6 +719,7 @@ static int mb_config_add_data(oconfig_item_t *ci) /* {{{ */
   data.name = NULL;
   data.register_type = REG_TYPE_UINT16;
   data.next = NULL;
+  data.mask = 0;
 
   status = cf_util_get_string(ci, &data.name);
   if (status != 0)
@@ -712,6 +754,20 @@ static int mb_config_add_data(oconfig_item_t *ci) /* {{{ */
         ERROR("Modbus plugin: The register type \"%s\" is unknown.", tmp);
         status = -1;
       }
+    } else if (strcasecmp ("Endianness", child->key) == 0) {
+      char tmp[16];
+      status = cf_util_get_string_buffer (child, tmp, sizeof (tmp));
+      if (status != 0)
+        /* do nothing */;
+      else if (strcasecmp ("big", tmp) == 0)
+        data.endianness = ENDIAN_BIG;
+      else if (strcasecmp ("little", tmp) == 0)
+        data.endianness = ENDIAN_LITTLE;
+      else
+      {
+        ERROR ("Modbus plugin: The \"%s\" endianness is unknown.", tmp);
+        status = -1;
+      }
     } else if (strcasecmp("RegisterCmd", child->key) == 0) {
 #if LEGACY_LIBMODBUS
       ERROR("Modbus plugin: RegisterCmd parameter can not be used "
@@ -725,12 +781,30 @@ static int mb_config_add_data(oconfig_item_t *ci) /* {{{ */
         data.modbus_register_type = MREG_HOLDING;
       else if (strcasecmp("ReadInput", tmp) == 0)
         data.modbus_register_type = MREG_INPUT;
+      else if (strcasecmp ("coil", tmp) == 0)
+	    data.modbus_register_type = MREG_COIL;
+      else if (strcasecmp ("discrete_input", tmp) == 0)
+        data.modbus_register_type = MREG_DISCRETE_INPUT;
       else {
         ERROR("Modbus plugin: The modbus_register_type \"%s\" is unknown.",
               tmp);
         status = -1;
       }
 #endif
+    } else if (strcasecmp ("Mask", child->key) == 0) {
+      char tmp[20];
+      status = cf_util_get_string_buffer (child, tmp, sizeof (tmp));
+      if (status != 0)
+        /* do nothing */;
+      else {
+	    if(strncmp(tmp, "0b", 2) == 0){
+          data.mask=strtol(tmp+2,NULL,2);
+        } else if (strncmp(tmp, "0x", 2) == 0) {
+          data.mask=strtol(tmp+2,NULL,16);
+        } else {
+          data.mask=strtol(tmp,NULL,10);
+        }
+      }
     } else {
       ERROR("Modbus plugin: Unknown configuration option: %s", child->key);
       status = -1;
