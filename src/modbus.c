@@ -64,6 +64,7 @@
  *   # Baudrate 38400
  *   # (Assumes 8N1)
  *   Interval 60
+ *   Timeout 0.500
  *
  *   <Slave 1>
  *     Instance "foobar" # optional
@@ -126,6 +127,7 @@ struct mb_host_s /* {{{ */
   /* char service[NI_MAXSERV]; */
   int port;     /* for Modbus/TCP */
   int baudrate; /* for Modbus/RTU */
+  cdtime_t timeout;
   mb_conntype_t conntype;
   cdtime_t interval;
 
@@ -344,7 +346,6 @@ static int mb_init_connection(mb_host_t *host) /* {{{ */
 static int mb_init_connection(mb_host_t *host) /* {{{ */
 {
   int status;
-  struct timeval response_timeout;
 
   if (host == NULL)
     return (EINVAL);
@@ -375,10 +376,12 @@ static int mb_init_connection(mb_host_t *host) /* {{{ */
     }
   }
 
-  response_timeout.tv_sec = 30;
-  response_timeout.tv_usec = 0;
-  modbus_set_response_timeout(host->connection, &response_timeout);
-
+  if (host->timeout > 0) {
+    struct timeval response_timeout = CDTIME_T_TO_TIMEVAL(host->timeout);
+    DEBUG("Modbus plugin: setting connection timeout %i sec, %i usec.",
+          response_timeout.tv_sec, response_timeout.tv_usec);
+    modbus_set_response_timeout(host->connection, &response_timeout);
+  }
 #if COLLECT_DEBUG
   modbus_set_debug(host->connection, 1);
 #endif
@@ -539,7 +542,11 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
     float float_value;
     value_t vt;
 
-    float_value = mb_register_to_float(values[0], values[1]);
+    if (data->endianness == ENDIAN_LITTLE) {
+      float_value = mb_register_to_float(values[1], values[0]);
+    } else {
+      float_value = mb_register_to_float(values[0], values[1]);
+    }
     DEBUG("Modbus plugin: mb_read_data: "
           "Returned float value is %g",
           (double)float_value);
@@ -554,11 +561,9 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
     value_t vt;
 
     if (data->endianness == ENDIAN_LITTLE) {
-      v.u32 = (((uint32_t) values[1]) << 16)
-        | ((uint32_t) values[0]);
+      v.u32 = (((uint32_t) values[1]) << 16) | ((uint32_t) values[0]);
     } else {
-      v.u32 = (((uint32_t) values[0]) << 16)
-        | ((uint32_t) values[1]); 
+      v.u32 = (((uint32_t) values[0]) << 16) | ((uint32_t) values[1]);
     }
     DEBUG ("Modbus plugin: mb_read_data: "
         "Returned int32 value is %"PRIi32, v.i32);
@@ -584,7 +589,11 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
     uint32_t v32;
     value_t vt;
 
-    v32 = (((uint32_t)values[0]) << 16) | ((uint32_t)values[1]);
+    if (data->endianness == ENDIAN_LITTLE) {
+      v32 = (((uint32_t)values[1]) << 16) | ((uint32_t)values[0]);
+    } else {
+      v32 = (((uint32_t)values[0]) << 16) | ((uint32_t)values[1]);
+    }
     DEBUG("Modbus plugin: mb_read_data: "
           "Returned uint32 value is %" PRIu32,
           v32);
@@ -773,7 +782,7 @@ static int mb_config_add_data(oconfig_item_t *ci) /* {{{ */
       ERROR("Modbus plugin: RegisterCmd parameter can not be used "
             "with your libmodbus version");
 #else
-      char tmp[16];
+      char tmp[20];
       status = cf_util_get_string_buffer(child, tmp, sizeof(tmp));
       if (status != 0)
         /* do nothing */;
@@ -781,9 +790,9 @@ static int mb_config_add_data(oconfig_item_t *ci) /* {{{ */
         data.modbus_register_type = MREG_HOLDING;
       else if (strcasecmp("ReadInput", tmp) == 0)
         data.modbus_register_type = MREG_INPUT;
-      else if (strcasecmp ("coil", tmp) == 0)
+      else if (strcasecmp ("ReadCoil", tmp) == 0)
 	    data.modbus_register_type = MREG_COIL;
-      else if (strcasecmp ("discrete_input", tmp) == 0)
+      else if (strcasecmp ("ReadDiscreteInput", tmp) == 0)
         data.modbus_register_type = MREG_DISCRETE_INPUT;
       else {
         ERROR("Modbus plugin: The modbus_register_type \"%s\" is unknown.",
@@ -975,6 +984,8 @@ static int mb_config_add_host(oconfig_item_t *ci) /* {{{ */
     else if (strcasecmp("Slave", child->key) == 0)
       /* Don't set status: Gracefully continue if a slave fails. */
       mb_config_add_slave(host, child);
+    else if (strcasecmp ("Timeout", child->key) == 0)
+      status = cf_util_get_cdtime(child, &host->timeout);
     else {
       ERROR("Modbus plugin: Unknown configuration option: %s", child->key);
       status = -1;
