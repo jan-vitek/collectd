@@ -87,8 +87,14 @@ enum mb_mreg_type_e /* {{{ */
   MREG_INPUT,
   MREG_COIL,
   MREG_DISCRETE_INPUT }; /* }}} */
+enum mb_endianness_e /* {{{ */
+{
+  ENDIAN_BIG,
+  ENDIAN_LITTLE
+}; /* }}} */
 typedef enum mb_register_type_e mb_register_type_t;
 typedef enum mb_mreg_type_e mb_mreg_type_t;
+typedef enum mb_endianness_e mb_endianness_t;
 
 /* TCP or RTU depending on what is specified in host config block */
 enum mb_conntype_e /* {{{ */
@@ -628,7 +634,7 @@ static int mb_read_slave(mb_host_t *host, mb_slave_t *slave) /* {{{ */
     return (EINVAL);
 
   success = 0;
-  for (data = slave->collect; data != NULL; data = data->next) {
+  for (mb_data_t *data = slave->collect; data != NULL; data = data->next) {
     status = mb_read_data (host, slave, data);
     if (status != 0) {
       ERROR ("Modbus plugin: modbus_read_registers (%s/%s) failed. "
