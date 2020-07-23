@@ -167,6 +167,22 @@ static int ut_config_type_min(threshold_t *th, oconfig_item_t *ci) {
   return (0);
 } /* int ut_config_type_min */
 
+static int ut_config_type_value(threshold_t *th, oconfig_item_t *ci) {
+  if ((ci->values_num != 1) || (ci->values[0].type != OCONFIG_TYPE_NUMBER)) {
+    WARNING("threshold values: The `%s' option needs exactly one "
+            "number argument.",
+            ci->key);
+    return (-1);
+  }
+
+  if (strcasecmp(ci->key, "WarningValue") == 0)
+    th->warning_value = ci->values[0].value.number;
+  else
+    th->failure_value = ci->values[0].value.number;
+
+  return (0);
+} /* int ut_config_type_value */
+
 static int ut_config_type_hits(threshold_t *th, oconfig_item_t *ci) {
   if ((ci->values_num != 1) || (ci->values[0].type != OCONFIG_TYPE_NUMBER)) {
     WARNING("threshold values: The `%s' option needs exactly one "
@@ -213,8 +229,10 @@ static int ut_config_type(const threshold_t *th_orig, oconfig_item_t *ci) {
 
   th.warning_min = NAN;
   th.warning_max = NAN;
+  th.warning_value = NAN;
   th.failure_min = NAN;
   th.failure_max = NAN;
+  th.failure_value = NAN;
   th.hits = 0;
   th.hysteresis = 0;
   th.flags = UT_FLAG_INTERESTING; /* interesting by default */
@@ -232,6 +250,9 @@ static int ut_config_type(const threshold_t *th_orig, oconfig_item_t *ci) {
     else if ((strcasecmp("WarningMin", option->key) == 0) ||
              (strcasecmp("FailureMin", option->key) == 0))
       status = ut_config_type_min(&th, option);
+    else if ((strcasecmp("WarningValue", option->key) == 0) ||
+             (strcasecmp("FailureValue", option->key) == 0))
+      status = ut_config_type_value(&th, option);
     else if (strcasecmp("Interesting", option->key) == 0)
       status = cf_util_get_flag(option, &th.flags, UT_FLAG_INTERESTING);
     else if (strcasecmp("Invert", option->key) == 0)
@@ -448,8 +469,10 @@ static int ut_report_state(const data_set_t *ds, const value_list_t *vl,
   plugin_notification_meta_add_double(&n, "CurrentValue", values[ds_index]);
   plugin_notification_meta_add_double(&n, "WarningMin", th->warning_min);
   plugin_notification_meta_add_double(&n, "WarningMax", th->warning_max);
+  plugin_notification_meta_add_double(&n, "WarningValue", th->warning_value);
   plugin_notification_meta_add_double(&n, "FailureMin", th->failure_min);
   plugin_notification_meta_add_double(&n, "FailureMax", th->failure_max);
+  plugin_notification_meta_add_double(&n, "FailureValue", th->failure_value);
 
   /* Send an okay notification */
   if (state == STATE_OKAY) {
@@ -462,9 +485,11 @@ static int ut_report_state(const data_set_t *ds, const value_list_t *vl,
   } else {
     double min;
     double max;
+    double exact_value;
 
     min = (state == STATE_ERROR) ? th->failure_min : th->warning_min;
     max = (state == STATE_ERROR) ? th->failure_max : th->warning_max;
+    exact_value = (state == STATE_ERROR) ? th->failure_value : th->warning_value;
 
     if (th->flags & UT_FLAG_INVERT) {
       if (!isnan(min) && !isnan(max)) {
@@ -474,6 +499,13 @@ static int ut_report_state(const data_set_t *ds, const value_list_t *vl,
                   ds->ds[ds_index].name, values[ds_index],
                   (state == STATE_ERROR) ? "failure" : "warning", min,
                   ((th->flags & UT_FLAG_PERCENTAGE) != 0) ? "%" : "", max,
+                  ((th->flags & UT_FLAG_PERCENTAGE) != 0) ? "%" : "");
+      } else if (!isnan(exact_value) && exact_value != values[ds_index]) {
+        ssnprintf(buf, bufsize, ": Data source \"%s\" is currently "
+                                "%f. That is not equal to %s threshold value of %f%s.",
+                  ds->ds[ds_index].name, values[ds_index],
+                  (state == STATE_ERROR) ? "failure" : "warning",
+                  exact_value,
                   ((th->flags & UT_FLAG_PERCENTAGE) != 0) ? "%" : "");
       } else {
         ssnprintf(buf, bufsize, ": Data source \"%s\" is currently "
@@ -487,6 +519,7 @@ static int ut_report_state(const data_set_t *ds, const value_list_t *vl,
     } else if (th->flags & UT_FLAG_PERCENTAGE) {
       gauge_t value;
       gauge_t sum;
+      double reached_threshold;
 
       sum = 0.0;
       for (size_t i = 0; i < vl->values_len; i++) {
@@ -501,21 +534,33 @@ static int ut_report_state(const data_set_t *ds, const value_list_t *vl,
       else
         value = 100.0 * values[ds_index] / sum;
 
+      reached_threshold = (value < min) ? min : max;
+      reached_threshold = (value == exact_value) ? exact_value : reached_threshold;
+
       ssnprintf(buf, bufsize,
                 ": Data source \"%s\" is currently "
                 "%g (%.2f%%). That is %s the %s threshold of %.2f%%.",
                 ds->ds[ds_index].name, values[ds_index], value,
                 (value < min) ? "below" : "above",
                 (state == STATE_ERROR) ? "failure" : "warning",
-                (value < min) ? min : max);
+                reached_threshold);
     } else /* is not inverted */
     {
-      ssnprintf(buf, bufsize, ": Data source \"%s\" is currently "
-                              "%f. That is %s the %s threshold of %f.",
-                ds->ds[ds_index].name, values[ds_index],
-                (values[ds_index] < min) ? "below" : "above",
-                (state == STATE_ERROR) ? "failure" : "warning",
-                (values[ds_index] < min) ? min : max);
+      if (!isnan(exact_value) && exact_value == values[ds_index]) {
+        ssnprintf(buf, bufsize, ": Data source \"%s\" is currently "
+                                "%f. That is equal to %s threshold value of %f%s.",
+                  ds->ds[ds_index].name, values[ds_index],
+                  (state == STATE_ERROR) ? "failure" : "warning",
+                  exact_value,
+                  ((th->flags & UT_FLAG_PERCENTAGE) != 0) ? "%" : "");
+      } else {
+        ssnprintf(buf, bufsize, ": Data source \"%s\" is currently "
+                                "%f. That is %s the %s threshold of %f.",
+                  ds->ds[ds_index].name, values[ds_index],
+                  (values[ds_index] < min) ? "below" : "above",
+                  (state == STATE_ERROR) ? "failure" : "warning",
+                  (values[ds_index] < min) ? min : max);
+      }
     }
   }
 
@@ -551,8 +596,10 @@ static int ut_check_one_data_source(
   }
 
   if ((th->flags & UT_FLAG_INVERT) != 0) {
-    is_warning--;
-    is_failure--;
+    if (!isnan(th->warning_min) || !isnan(th->warning_max) || !isnan(th->warning_value))
+      is_warning--;
+    if (!isnan(th->failure_min) || !isnan(th->failure_max) || !isnan(th->failure_value))
+      is_failure--;
   }
 
   /* XXX: This is an experimental code, not optimized, not fast, not reliable,
@@ -595,11 +642,13 @@ static int ut_check_one_data_source(
 
   } else { /* no hysteresis */
     if ((!isnan(th->failure_min) && (th->failure_min > values[ds_index])) ||
-        (!isnan(th->failure_max) && (th->failure_max < values[ds_index])))
+        (!isnan(th->failure_max) && (th->failure_max < values[ds_index])) ||
+        (!isnan(th->failure_value) && (th->failure_value == values[ds_index])))
       is_failure++;
 
     if ((!isnan(th->warning_min) && (th->warning_min > values[ds_index])) ||
-        (!isnan(th->warning_max) && (th->warning_max < values[ds_index])))
+        (!isnan(th->warning_max) && (th->warning_max < values[ds_index])) ||
+        (!isnan(th->warning_value) && (th->warning_value == values[ds_index])))
       is_warning++;
   }
 
@@ -797,8 +846,10 @@ static int ut_config(oconfig_item_t *ci) { /* {{{ */
   threshold_t th = {
       .warning_min = NAN,
       .warning_max = NAN,
+      .warning_value = NAN,
       .failure_min = NAN,
       .failure_max = NAN,
+      .failure_value = NAN,
       .flags = UT_FLAG_INTERESTING /* interesting by default */
   };
 

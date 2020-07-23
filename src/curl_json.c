@@ -71,6 +71,9 @@ struct cj_s /* {{{ */
   char *user;
   char *pass;
   char *credentials;
+  char *post_login_url;
+  char *post_login_data;
+  char *cookies_file_path;
   _Bool digest;
   _Bool verify_peer;
   _Bool verify_host;
@@ -109,9 +112,15 @@ typedef unsigned int yajl_len_t;
 static int cj_read(user_data_t *ud);
 static void cj_submit(cj_t *db, cj_key_t *key, value_t *value);
 
+static size_t cj_curl_login_callback(void *buf, /* {{{ */
+                               size_t size, size_t nmemb, void *user_data) {
+  return (size * nmemb);
+}
+
 static size_t cj_curl_callback(void *buf, /* {{{ */
                                size_t size, size_t nmemb, void *user_data) {
   cj_t *db;
+  long rc;
   size_t len;
   yajl_status status;
 
@@ -121,6 +130,14 @@ static size_t cj_curl_callback(void *buf, /* {{{ */
     return (len);
 
   db = user_data;
+
+  // ignore input from failed requests so the yajl hendle can be reused later
+  // prevents trailing garbage error after successful curl POST login 
+  curl_easy_getinfo(db->curl, CURLINFO_RESPONSE_CODE, &rc);
+  if ((rc != 0) && (rc != 200)) {
+    return(len); 
+  }
+
   if (db == NULL)
     return (0);
 
@@ -662,6 +679,12 @@ static int cj_config_add_url(oconfig_item_t *ci) /* {{{ */
       status = cf_util_get_string(child, &db->user);
     else if (db->url && strcasecmp("Password", child->key) == 0)
       status = cf_util_get_string(child, &db->pass);
+    else if (db->url && strcasecmp("POSTLoginURL", child->key) == 0)
+      status = cf_util_get_string(child, &db->post_login_url);
+    else if (db->url && strcasecmp("POSTLoginData", child->key) == 0)
+      status = cf_util_get_string(child, &db->post_login_data);
+    else if (db->url && strcasecmp("CookiesFilePath", child->key) == 0)
+      status = cf_util_get_string(child, &db->cookies_file_path);
     else if (strcasecmp("Digest", child->key) == 0)
       status = cf_util_get_boolean(child, &db->digest);
     else if (db->url && strcasecmp("VerifyPeer", child->key) == 0)
@@ -835,20 +858,76 @@ static int cj_sock_perform(cj_t *db) /* {{{ */
   return (0);
 } /* }}} int cj_sock_perform */
 
+static int cj_curl_post_login(cj_t *db)
+{
+  int status;
+  int return_code = 0;
+  struct curl_slist *headers = NULL;
+  headers = curl_slist_append(headers, "Accept: application/json");
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+
+  if(db->cookies_file_path == NULL)
+    db->cookies_file_path = tmpnam(NULL);
+
+  curl_easy_setopt(db->curl, CURLOPT_URL, db->post_login_url);
+  curl_easy_setopt(db->curl, CURLOPT_POSTFIELDS, db->post_login_data);
+  curl_easy_setopt(db->curl, CURLOPT_COOKIEJAR, db->cookies_file_path);
+  curl_easy_setopt(db->curl, CURLOPT_COOKIEFILE, db->cookies_file_path);
+  curl_easy_setopt(db->curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(db->curl, CURLOPT_WRITEFUNCTION, cj_curl_login_callback);
+  
+
+  status = curl_easy_perform(db->curl);
+  if (status != CURLE_OK) {
+    ERROR("curl_json plugin: curl_post_login failed with status %i: %s (%s)",
+          status, db->curl_errbuf, db->post_login_url);
+    return_code = -1;
+  }
+
+  if (db->post_body != NULL) {
+    curl_easy_setopt(db->curl, CURLOPT_POSTFIELDS, db->post_body);
+  } else {
+    curl_easy_setopt(db->curl, CURLOPT_POSTFIELDS, "");
+    curl_easy_setopt(db->curl, CURLOPT_HTTPGET, 1L);
+  }
+  curl_easy_setopt(db->curl, CURLOPT_URL, db->url);
+  curl_easy_setopt(db->curl, CURLOPT_HTTPHEADER, db->headers);
+  curl_easy_setopt(db->curl, CURLOPT_WRITEFUNCTION, cj_curl_callback);
+
+  return return_code;
+}
+
 static int cj_curl_perform(cj_t *db) /* {{{ */
 {
   int status;
   long rc;
   char *url;
-
+  
   curl_easy_setopt(db->curl, CURLOPT_URL, db->url);
+
+  DEBUG("Loading json.");
 
   status = curl_easy_perform(db->curl);
   if (status != CURLE_OK) {
-    ERROR("curl_json plugin: curl_easy_perform failed with status %i: %s (%s)",
+    ERROR("curl_json plugin: curl_easy_perform failed with status %i: %s (%s).",
           status, db->curl_errbuf, db->url);
     return (-1);
   }
+
+  curl_easy_getinfo(db->curl, CURLINFO_RESPONSE_CODE, &rc);
+  if ((rc == 401) && (db->post_login_url != NULL)) {
+    DEBUG("curl_json plugin: unauthorized, trying curl POST login");
+    status = cj_curl_post_login(db);
+    if (status == 0) {
+      status = curl_easy_perform(db->curl);
+      if (status != CURLE_OK) {
+        ERROR("curl_json plugin: post login was successful, however curl_easy_perform failed with status %i: %s (%s).",
+              status, db->curl_errbuf, db->url);
+        return (-1);
+      }
+    }    
+  }
+
   if (db->stats != NULL)
     curl_stats_dispatch(db->stats, db->curl, cj_host(db), "curl_json",
                         db->instance);

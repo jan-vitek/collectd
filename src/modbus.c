@@ -51,6 +51,8 @@
  *   RegisterCmd ReadHolding
  *   RegisterType float
  *   Type gauge
+ *   Endianness big
+ *   Mask 0b100
  *   Instance "..."
  * </Data>
  *
@@ -62,6 +64,8 @@
  *   # Baudrate 38400
  *   # (Assumes 8N1)
  *   Interval 60
+ *   Timeout 0.500
+ *   BundleSize 64
  *
  *   <Slave 1>
  *     Instance "foobar" # optional
@@ -81,9 +85,17 @@ enum mb_register_type_e /* {{{ */
   REG_TYPE_FLOAT }; /* }}} */
 enum mb_mreg_type_e /* {{{ */
 { MREG_HOLDING,
-  MREG_INPUT }; /* }}} */
+  MREG_INPUT,
+  MREG_COIL,
+  MREG_DISCRETE_INPUT }; /* }}} */
+enum mb_endianness_e /* {{{ */
+{
+  ENDIAN_BIG,
+  ENDIAN_LITTLE
+}; /* }}} */
 typedef enum mb_register_type_e mb_register_type_t;
 typedef enum mb_mreg_type_e mb_mreg_type_t;
+typedef enum mb_endianness_e mb_endianness_t;
 
 /* TCP or RTU depending on what is specified in host config block */
 enum mb_conntype_e /* {{{ */
@@ -99,6 +111,8 @@ struct mb_data_s /* {{{ */
   int register_base;
   mb_register_type_t register_type;
   mb_mreg_type_t modbus_register_type;
+  mb_endianness_t endianness;
+  long mask;
   char type[DATA_MAX_NAME_LEN];
   char instance[DATA_MAX_NAME_LEN];
 
@@ -117,9 +131,12 @@ struct mb_host_s /* {{{ */
 {
   char host[DATA_MAX_NAME_LEN];
   char node[NI_MAXHOST]; /* TCP hostname or RTU serial device */
+  char config_address[NI_MAXHOST];
   /* char service[NI_MAXSERV]; */
   int port;     /* for Modbus/TCP */
   int baudrate; /* for Modbus/RTU */
+  int max_bundle_size;
+  cdtime_t timeout;
   mb_conntype_t conntype;
   cdtime_t interval;
 
@@ -145,6 +162,18 @@ struct mb_data_group_s /* {{{ */
   mb_data_group_t *next;
 }; /* }}} */
 
+struct mb_data_bundle_s;
+typedef struct mb_data_bundle_s mb_data_bundle_t;
+struct mb_data_bundle_s /* {{{ */
+{
+  int register_base;
+  int register_count;
+  int max_size;
+  mb_mreg_type_t modbus_register_type;
+  mb_data_t *data;
+  mb_data_t *data_last;
+}; /* }}} */
+
 /*
  * Global variables
  */
@@ -153,6 +182,37 @@ static mb_data_t *data_definitions = NULL;
 /*
  * Functions
  */
+
+static int mb_config_set_host_address(mb_host_t *host, const char *address);
+
+static int data_values_num(mb_data_t *data){
+  int values_num;
+  if ((data->register_type == REG_TYPE_INT32) ||
+      (data->register_type == REG_TYPE_UINT32) ||
+      (data->register_type == REG_TYPE_FLOAT))
+    values_num = 2;
+  else
+    values_num = 1;
+
+  return values_num;
+} /* }}} int data_values_num */
+
+static int cannot_add_to_bundle(mb_data_bundle_t *bundle, mb_data_t *data){
+  if ((bundle == NULL) || (data == NULL))
+    return (EINVAL);
+  
+  if (bundle->data == NULL)
+    return 1;
+  if ((bundle->register_count + data_values_num(data)) >= bundle->max_size)
+    return 1;
+  if (bundle->modbus_register_type != data->modbus_register_type)
+    return 1;
+  if ((bundle->data_last->register_base + data_values_num(bundle->data_last))
+      != data->register_base)
+    return 1;
+  return 0;
+}
+
 static mb_data_t *data_get_by_name(mb_data_t *src, /* {{{ */
                                    const char *name) {
   if (name == NULL)
@@ -302,6 +362,10 @@ static int mb_init_connection(mb_host_t *host) /* {{{ */
   /* We'll do the error handling ourselves. */
   modbus_set_error_handling(&host->connection, NOP_ON_ERROR);
 
+  if ((host->max_bundle_size == NULL) || (host->max_bundle_size < 1) || 
+      (host->max_bundle_size > 128))
+    host->max_bundle_size = 1;
+
   if (host->conntype == MBCONN_TCP) {
     if ((host->port < 1) || (host->port > 65535))
       host->port = MODBUS_TCP_DEFAULT_PORT;
@@ -309,7 +373,9 @@ static int mb_init_connection(mb_host_t *host) /* {{{ */
     DEBUG("Modbus plugin: Trying to connect to \"%s\", port %i.", host->node,
           host->port);
 
-    modbus_init_tcp(&host->connection,
+    status = mb_config_set_host_address(host, host->config_address);
+    if(status == 0)
+      modbus_init_tcp(&host->connection,
                     /* host = */ host->node,
                     /* port = */ host->port);
   } else /* MBCONN_RTU */
@@ -351,8 +417,10 @@ static int mb_init_connection(mb_host_t *host) /* {{{ */
 
     DEBUG("Modbus plugin: Trying to connect to \"%s\", port %i.", host->node,
           host->port);
-
-    host->connection = modbus_new_tcp(host->node, host->port);
+    
+    status = mb_config_set_host_address(host, host->config_address);
+    if(status == 0)
+      host->connection = modbus_new_tcp(host->node, host->port);
     if (host->connection == NULL) {
       ERROR("Modbus plugin: Creating new Modbus/TCP object failed.");
       return (-1);
@@ -368,6 +436,12 @@ static int mb_init_connection(mb_host_t *host) /* {{{ */
     }
   }
 
+  if (host->timeout > 0) {
+    struct timeval response_timeout = CDTIME_T_TO_TIMEVAL(host->timeout);
+    DEBUG("Modbus plugin: setting connection timeout %i sec, %i usec.",
+          response_timeout.tv_sec, response_timeout.tv_usec);
+    modbus_set_response_timeout(host->connection, &response_timeout);
+  }
 #if COLLECT_DEBUG
   modbus_set_debug(host->connection, 1);
 #endif
@@ -400,46 +474,153 @@ static int mb_init_connection(mb_host_t *host) /* {{{ */
       (vt).absolute = (absolute_t)(raw);                                       \
   } while (0)
 
-static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
-                        mb_data_t *data) {
+static int mb_read_preloaded_data(mb_host_t *host, /* {{{ */
+                                  mb_slave_t *slave,
+                                  mb_data_bundle_t *bundle, 
+                                  uint16_t *cache) {
   uint16_t values[2] = {0};
   int values_num;
   const data_set_t *ds;
-  int status = 0;
-
-  if ((host == NULL) || (slave == NULL) || (data == NULL))
+  uint16_t *current_cache_position = cache;
+  uint16_t *original_cache_position = cache;
+   
+  if ((host == NULL) || (slave == NULL) || (bundle == NULL) || (cache == NULL))
     return (EINVAL);
 
-  ds = plugin_get_ds(data->type);
-  if (ds == NULL) {
-    ERROR("Modbus plugin: Type \"%s\" is not defined.", data->type);
-    return (-1);
+  if (bundle->data == NULL)
+    return 0;
+
+  for (mb_data_t *data = bundle->data; data != bundle->data_last->next;
+       data = data->next) {
+    ds = plugin_get_ds(data->type);
+    if (ds == NULL) {
+      ERROR("Modbus plugin: Type \"%s\" is not defined.", data->type);
+      return (-1);
+    }
+    
+    if (ds->ds_num != 1) {
+      ERROR("Modbus plugin: The type \"%s\" has %zu data sources. "
+            "I can only handle data sets with only one data source.",
+            data->type, ds->ds_num);
+      return (-1);
+    }
+    
+    if ((ds->ds[0].type != DS_TYPE_GAUGE) &&
+        (data->register_type != REG_TYPE_INT32) &&
+        (data->register_type != REG_TYPE_UINT32)) {
+      NOTICE(
+             "Modbus plugin: The data source of type \"%s\" is %s, not gauge. "
+             "This will most likely result in problems, because the register type "
+             "is not UINT32.",
+             data->type, DS_TYPE_TO_STRING(ds->ds[0].type));
+    }
+    
+    values_num = data_values_num(data);
+    
+    memset(values, 0, sizeof(values));
+    
+    original_cache_position = current_cache_position;
+
+    for (int i=0; i<values_num; ++i) {
+      values[i] = current_cache_position[0];
+      current_cache_position++;
+    }
+   
+    if ((data->next != NULL) && (data->register_base == data->next->register_base)) {
+      current_cache_position = original_cache_position;
+    }
+    
+    if (data->register_type == REG_TYPE_FLOAT) {
+      float float_value;
+      value_t vt;
+      
+      if (data->endianness == ENDIAN_LITTLE) {
+        float_value = mb_register_to_float(values[1], values[0]);
+      } else {
+        float_value = mb_register_to_float(values[0], values[1]);
+      }
+      DEBUG("Modbus plugin: mb_read_preloaded_data: "
+            "Returned float value is %g",
+            (double)float_value);
+      
+      CAST_TO_VALUE_T(ds, vt, float_value);
+      mb_submit(host, slave, data, vt);
+    } else if (data->register_type == REG_TYPE_INT32) {
+      union {
+        uint32_t u32;
+        int32_t i32;
+      } v;
+      value_t vt;
+      
+      if (data->endianness == ENDIAN_LITTLE) {
+        v.u32 = (((uint32_t) values[1]) << 16) | ((uint32_t) values[0]);
+      } else {
+        v.u32 = (((uint32_t) values[0]) << 16) | ((uint32_t) values[1]);
+      }
+      DEBUG ("Modbus plugin: mb_read_preloaded_data: "
+             "Returned int32 value is %"PRIi32, v.i32);
+      
+      CAST_TO_VALUE_T(ds, vt, v.i32);
+      mb_submit(host, slave, data, vt);
+    } else if (data->register_type == REG_TYPE_INT16) {
+      union {
+        uint16_t u16;
+        int16_t i16;
+      } v;
+      value_t vt;
+      
+      v.u16 = values[0];
+      
+      DEBUG("Modbus plugin: mb_read_preloaded_data: "
+            "Returned int16 value is %" PRIi16,
+            v.i16);
+      
+      CAST_TO_VALUE_T(ds, vt, v.i16);
+      mb_submit(host, slave, data, vt);
+    } else if (data->register_type == REG_TYPE_UINT32) {
+      uint32_t v32;
+      value_t vt;
+      
+      if (data->endianness == ENDIAN_LITTLE) {
+        v32 = (((uint32_t)values[1]) << 16) | ((uint32_t)values[0]);
+      } else {
+        v32 = (((uint32_t)values[0]) << 16) | ((uint32_t)values[1]);
+      }
+      DEBUG("Modbus plugin: mb_read_preloaded_data: "
+            "Returned uint32 value is %" PRIu32,
+            v32);
+      
+      CAST_TO_VALUE_T(ds, vt, v32);
+      mb_submit(host, slave, data, vt);
+    } else /* if (data->register_type == REG_TYPE_UINT16) */
+    {
+      value_t vt;
+      
+      DEBUG("Modbus plugin: mb_read_preloaded_data: "
+            "Returned uint16 value is %" PRIu16,
+            values[0]);
+      
+      if (data->mask) {
+        values[0] = values[0] & data->mask;
+      }
+      
+      CAST_TO_VALUE_T (ds, vt, values[0]);
+      mb_submit (host, slave, data, vt);
+    }
   }
+  
+  return (0);
+} /* }}} */
 
-  if (ds->ds_num != 1) {
-    ERROR("Modbus plugin: The type \"%s\" has %zu data sources. "
-          "I can only handle data sets with only one data source.",
-          data->type, ds->ds_num);
-    return (-1);
-  }
-
-  if ((ds->ds[0].type != DS_TYPE_GAUGE) &&
-      (data->register_type != REG_TYPE_INT32) &&
-      (data->register_type != REG_TYPE_UINT32)) {
-    NOTICE(
-        "Modbus plugin: The data source of type \"%s\" is %s, not gauge. "
-        "This will most likely result in problems, because the register type "
-        "is not UINT32.",
-        data->type, DS_TYPE_TO_STRING(ds->ds[0].type));
-  }
-
-  if ((data->register_type == REG_TYPE_INT32) ||
-      (data->register_type == REG_TYPE_UINT32) ||
-      (data->register_type == REG_TYPE_FLOAT))
-    values_num = 2;
-  else
-    values_num = 1;
-
+static int mb_read_bundle(mb_host_t *host, mb_slave_t *slave, /* {{{ */
+                          mb_data_bundle_t *bundle) {
+  uint16_t values[128] = {0};
+  int status = 0; 
+ 
+  if ((host == NULL) || (slave == NULL) || (bundle == NULL))
+    return (EINVAL);
+  
+  
   if (host->connection == NULL) {
     status = EBADF;
   } else if (host->conntype == MBCONN_TCP) {
@@ -450,7 +631,7 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
                     &(socklen_t){sizeof(struct sockaddr_storage)}) != 0)
       status = errno;
   }
-
+  
   if ((status == EBADF) || (status == ENOTSOCK) || (status == ENOTCONN)) {
     status = mb_init_connection(host);
     if (status != 0) {
@@ -468,12 +649,12 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
     modbus_free(host->connection);
 #endif
   }
-
+  
 #if LEGACY_LIBMODBUS
-/* Version 2.0.3: Pass the connection struct as a pointer and pass the slave
- * id to each call of "read_holding_registers". */
+  /* Version 2.0.3: Pass the connection struct as a pointer and pass the slave
+   * id to each call of "read_holding_registers". */
 #define modbus_read_registers(ctx, addr, nb, dest)                             \
-  read_holding_registers(&(ctx), slave->id, (addr), (nb), (dest))
+read_holding_registers(&(ctx), slave->id, (addr), (nb), (dest))
 #else /* if !LEGACY_LIBMODBUS */
   /* Version 2.9.2: Set the slave id once before querying the registers. */
   status = modbus_set_slave(host->connection, slave->id);
@@ -483,21 +664,39 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
     return (-1);
   }
 #endif
-  if (data->modbus_register_type == MREG_INPUT) {
+  if (bundle->modbus_register_type == MREG_INPUT) {
     status = modbus_read_input_registers(host->connection,
-                                         /* start_addr = */ data->register_base,
-                                         /* num_registers = */ values_num,
+                                         /* start_addr = */ bundle->register_base,
+                                         /* num_registers = */ bundle->register_count,
                                          /* buffer = */ values);
+  } else if (bundle->modbus_register_type == MREG_COIL){
+    uint8_t coil_values[128];
+    status = modbus_read_bits (host->connection,
+                               /* start_addr = */ bundle->register_base,
+                               /* num_registers = */ bundle->register_count,
+                               /* buffer = */ coil_values);
+    for (int i=0; i<128; ++i) {
+      values[i] = (uint16_t) coil_values[i];
+    }
+  } else if (bundle->modbus_register_type == MREG_DISCRETE_INPUT){
+    uint8_t input_values[128];
+    status = modbus_read_input_bits (host->connection,
+                                     /* start_addr = */ bundle->register_base,
+                                     /* num_registers = */ bundle->register_count,
+                                     /* buffer = */ input_values);
+    for (int i=0; i<128; ++i) {
+      values[i] = (uint16_t) input_values[i];
+    }
   } else {
     status = modbus_read_registers(host->connection,
-                                   /* start_addr = */ data->register_base,
-                                   /* num_registers = */ values_num,
+                                   /* start_addr = */ bundle->register_base,
+                                   /* num_registers = */ bundle->register_count,
                                    /* buffer = */ values);
   }
-  if (status != values_num) {
+  if (status != bundle->register_count) {
     ERROR("Modbus plugin: modbus read function (%s/%s) failed. "
-          " status = %i, values_num = %i. Giving up.",
-          host->host, host->node, status, values_num);
+          " status = %i, values_num = %i, error = %s. Giving up.",
+          host->host, host->node, status, bundle->register_count, modbus_strerror(errno));
 #if LEGACY_LIBMODBUS
     modbus_close(&host->connection);
 #else
@@ -507,88 +706,78 @@ static int mb_read_data(mb_host_t *host, mb_slave_t *slave, /* {{{ */
     host->connection = NULL;
     return (-1);
   }
-
-  DEBUG("Modbus plugin: mb_read_data: Success! "
+  
+  DEBUG("Modbus plugin: mb_read_bundle: Success! "
         "modbus_read_registers returned with status %i.",
         status);
-
-  if (data->register_type == REG_TYPE_FLOAT) {
-    float float_value;
-    value_t vt;
-
-    float_value = mb_register_to_float(values[0], values[1]);
-    DEBUG("Modbus plugin: mb_read_data: "
-          "Returned float value is %g",
-          (double)float_value);
-
-    CAST_TO_VALUE_T(ds, vt, float_value);
-    mb_submit(host, slave, data, vt);
-  } else if (data->register_type == REG_TYPE_INT32) {
-    union {
-      uint32_t u32;
-      int32_t i32;
-    } v;
-    value_t vt;
-
-    v.u32 = (((uint32_t)values[0]) << 16) | ((uint32_t)values[1]);
-    DEBUG("Modbus plugin: mb_read_data: "
-          "Returned int32 value is %" PRIi32,
-          v.i32);
-
-    CAST_TO_VALUE_T(ds, vt, v.i32);
-    mb_submit(host, slave, data, vt);
-  } else if (data->register_type == REG_TYPE_INT16) {
-    union {
-      uint16_t u16;
-      int16_t i16;
-    } v;
-    value_t vt;
-
-    v.u16 = values[0];
-
-    DEBUG("Modbus plugin: mb_read_data: "
-          "Returned int16 value is %" PRIi16,
-          v.i16);
-
-    CAST_TO_VALUE_T(ds, vt, v.i16);
-    mb_submit(host, slave, data, vt);
-  } else if (data->register_type == REG_TYPE_UINT32) {
-    uint32_t v32;
-    value_t vt;
-
-    v32 = (((uint32_t)values[0]) << 16) | ((uint32_t)values[1]);
-    DEBUG("Modbus plugin: mb_read_data: "
-          "Returned uint32 value is %" PRIu32,
-          v32);
-
-    CAST_TO_VALUE_T(ds, vt, v32);
-    mb_submit(host, slave, data, vt);
-  } else /* if (data->register_type == REG_TYPE_UINT16) */
-  {
-    value_t vt;
-
-    DEBUG("Modbus plugin: mb_read_data: "
-          "Returned uint16 value is %" PRIu16,
-          values[0]);
-
-    CAST_TO_VALUE_T(ds, vt, values[0]);
-    mb_submit(host, slave, data, vt);
-  }
-
-  return (0);
-} /* }}} int mb_read_data */
+  
+  mb_read_preloaded_data(host, slave, bundle, values);
+  
+  return 0;  
+} /* }}} */
 
 static int mb_read_slave(mb_host_t *host, mb_slave_t *slave) /* {{{ */
 {
   int success;
   int status;
+  mb_data_bundle_t bundle = {0};
 
   if ((host == NULL) || (slave == NULL))
     return (EINVAL);
 
   success = 0;
+  status = 0;
   for (mb_data_t *data = slave->collect; data != NULL; data = data->next) {
-    status = mb_read_data(host, slave, data);
+    if (cannot_add_to_bundle(&bundle, data)){
+      // read the last bundle
+      if (bundle.register_count > 0) {
+        status = mb_read_bundle (host, slave, &bundle);
+      }
+      if (status != 0) {
+        ERROR ("Modbus plugin: modbus_read_registers (%s/%s) failed. "
+               "Trying once more.", host->host, host->node);
+        status = mb_read_bundle (host, slave, &bundle);
+        if (status != 0) {
+          ERROR ("Modbus plugin: modbus_read_registers (%s/%s) failed. "
+                 "Giving up.", host->host, host->node);
+        }
+      }
+      // reset the bundle
+      memset(&bundle, 0, sizeof(bundle));
+      // initialize the new bundle
+      bundle.register_base = data->register_base;
+      bundle.register_count = data_values_num(data);
+      bundle.max_size = host->max_bundle_size;
+      bundle.modbus_register_type = data->modbus_register_type;
+      bundle.data = data;
+      bundle.data_last = data;
+      while((data->next != NULL) && (data->register_base == data->next->register_base)) {
+        data = data->next;
+        bundle.data_last = data;
+      }
+    } else {
+      bundle.data_last = data;
+      bundle.register_count += data_values_num(data);
+      while((data->next != NULL) && (data->register_base == data->next->register_base)) {
+        data = data->next;
+        bundle.data_last = data;
+      }
+    }
+    
+    if (data->next == NULL) {
+      //read the last bundle
+      status = mb_read_bundle (host, slave, &bundle);
+      if (status != 0) {
+        ERROR ("Modbus plugin: modbus_read_registers (%s/%s) failed. "
+               "Trying once more.", host->host, host->node);
+        status = mb_read_bundle (host, slave, &bundle);
+        if (status != 0) {
+          ERROR ("Modbus plugin: modbus_read_registers (%s/%s) failed. "
+                 "Giving up.", host->host, host->node);
+        }
+      }
+    }
+    
     if (status == 0)
       success++;
   }
@@ -678,6 +867,7 @@ static int mb_config_add_data(oconfig_item_t *ci) /* {{{ */
   data.name = NULL;
   data.register_type = REG_TYPE_UINT16;
   data.next = NULL;
+  data.mask = 0;
 
   status = cf_util_get_string(ci, &data.name);
   if (status != 0)
@@ -712,12 +902,26 @@ static int mb_config_add_data(oconfig_item_t *ci) /* {{{ */
         ERROR("Modbus plugin: The register type \"%s\" is unknown.", tmp);
         status = -1;
       }
+    } else if (strcasecmp ("Endianness", child->key) == 0) {
+      char tmp[16];
+      status = cf_util_get_string_buffer (child, tmp, sizeof (tmp));
+      if (status != 0)
+        /* do nothing */;
+      else if (strcasecmp ("big", tmp) == 0)
+        data.endianness = ENDIAN_BIG;
+      else if (strcasecmp ("little", tmp) == 0)
+        data.endianness = ENDIAN_LITTLE;
+      else
+      {
+        ERROR ("Modbus plugin: The \"%s\" endianness is unknown.", tmp);
+        status = -1;
+      }
     } else if (strcasecmp("RegisterCmd", child->key) == 0) {
 #if LEGACY_LIBMODBUS
       ERROR("Modbus plugin: RegisterCmd parameter can not be used "
             "with your libmodbus version");
 #else
-      char tmp[16];
+      char tmp[20];
       status = cf_util_get_string_buffer(child, tmp, sizeof(tmp));
       if (status != 0)
         /* do nothing */;
@@ -725,12 +929,30 @@ static int mb_config_add_data(oconfig_item_t *ci) /* {{{ */
         data.modbus_register_type = MREG_HOLDING;
       else if (strcasecmp("ReadInput", tmp) == 0)
         data.modbus_register_type = MREG_INPUT;
+      else if (strcasecmp ("ReadCoil", tmp) == 0)
+	    data.modbus_register_type = MREG_COIL;
+      else if (strcasecmp ("ReadDiscreteInput", tmp) == 0)
+        data.modbus_register_type = MREG_DISCRETE_INPUT;
       else {
         ERROR("Modbus plugin: The modbus_register_type \"%s\" is unknown.",
               tmp);
         status = -1;
       }
 #endif
+    } else if (strcasecmp ("Mask", child->key) == 0) {
+      char tmp[20];
+      status = cf_util_get_string_buffer (child, tmp, sizeof (tmp));
+      if (status != 0)
+        /* do nothing */;
+      else {
+	    if(strncmp(tmp, "0b", 2) == 0){
+          data.mask=strtol(tmp+2,NULL,2);
+        } else if (strncmp(tmp, "0x", 2) == 0) {
+          data.mask=strtol(tmp+2,NULL,16);
+        } else {
+          data.mask=strtol(tmp,NULL,10);
+        }
+      }
     } else {
       ERROR("Modbus plugin: Unknown configuration option: %s", child->key);
       status = -1;
@@ -880,10 +1102,9 @@ static int mb_config_add_host(oconfig_item_t *ci) /* {{{ */
     status = 0;
 
     if (strcasecmp("Address", child->key) == 0) {
-      char buffer[NI_MAXHOST];
-      status = cf_util_get_string_buffer(child, buffer, sizeof(buffer));
+      status = cf_util_get_string_buffer(child, host->config_address, sizeof(host->config_address));
       if (status == 0)
-        status = mb_config_set_host_address(host, buffer);
+        status = mb_config_set_host_address(host, host->config_address);
       if (status == 0)
         host->conntype = MBCONN_TCP;
     } else if (strcasecmp("Port", child->key) == 0) {
@@ -901,7 +1122,13 @@ static int mb_config_add_host(oconfig_item_t *ci) /* {{{ */
     else if (strcasecmp("Slave", child->key) == 0)
       /* Don't set status: Gracefully continue if a slave fails. */
       mb_config_add_slave(host, child);
-    else {
+    else if (strcasecmp ("Timeout", child->key) == 0)
+      status = cf_util_get_cdtime(child, &host->timeout);
+    else if (strcasecmp ("BundleSize", child->key) == 0) {
+      status = cf_util_get_int(child, &host->max_bundle_size);
+      if ((host->max_bundle_size < 1) || (host->max_bundle_size > 128))
+        host->max_bundle_size = 1;
+    } else {
       ERROR("Modbus plugin: Unknown configuration option: %s", child->key);
       status = -1;
     }

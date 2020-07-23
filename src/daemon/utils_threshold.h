@@ -41,8 +41,10 @@ typedef struct threshold_s {
   char data_source[DATA_MAX_NAME_LEN];
   gauge_t warning_min;
   gauge_t warning_max;
+  gauge_t warning_value;
   gauge_t failure_min;
   gauge_t failure_max;
+  gauge_t failure_value;
   gauge_t hysteresis;
   unsigned int flags;
   int hits;

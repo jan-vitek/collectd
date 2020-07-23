@@ -123,6 +123,64 @@ static int csnmp_read_host(user_data_t *ud);
 /*
  * Private functions
  */
+
+static double chars_to_double(char *string, int len){
+  int i;
+  int tmp = 40;
+  double ret = 0;
+  if (len>9){
+    len = 9;
+  }
+  for(i=0; i<len; ++i){
+    char val = tolower(string[i]);
+    switch (val) {
+      case 'a': tmp=1; break;
+      case 'b': tmp=2; break;
+      case 'c': tmp=3; break;
+      case 'd': tmp=4; break;
+      case 'e': tmp=5; break;
+      case 'f': tmp=6; break;
+      case 'g': tmp=7; break;
+      case 'h': tmp=8; break;
+      case 'i': tmp=9; break;
+      case 'j': tmp=10; break;
+      case 'k': tmp=11; break;
+      case 'l': tmp=12; break;
+      case 'm': tmp=13; break;
+      case 'n': tmp=14; break;
+      case 'o': tmp=15; break;
+      case 'p': tmp=16; break;
+      case 'q': tmp=17; break;
+      case 'r': tmp=18; break;
+      case 's': tmp=19; break;
+      case 't': tmp=20; break;
+      case 'u': tmp=21; break;
+      case 'v': tmp=22; break;
+      case 'w': tmp=23; break;
+      case 'x': tmp=24; break;
+      case 'y': tmp=25; break;
+      case 'z': tmp=26; break;
+      case '1': tmp=27; break;
+      case '2': tmp=28; break;
+      case '3': tmp=29; break;
+      case '4': tmp=30; break;
+      case '5': tmp=31; break;
+      case '6': tmp=32; break;
+      case '7': tmp=33; break;
+      case '8': tmp=34; break;
+      case '9': tmp=35; break;
+      case '0': tmp=36; break;
+      case ' ': tmp=37; break;
+      case '-': tmp=38; break;
+      case '_': tmp=39; break;
+      case '.': tmp=40; break;
+      default: tmp=40; break;
+    }
+    ret = ret*40 + tmp;    
+  }
+  return ret;
+}
+
 static void csnmp_oid_init(oid_t *dst, oid const *src, size_t n) {
   assert(n <= STATIC_ARRAY_SIZE(dst->oid));
   memcpy(dst->oid, src, sizeof(*src) * n);
@@ -894,8 +952,9 @@ static value_t csnmp_value_list_to_value(struct variable_list *vl, int type,
 
       status = parse_value(string, &ret, type);
       if (status != 0) {
-        ERROR("snmp plugin: host %s: csnmp_value_list_to_value: Parsing string "
-              "as %s failed: %s",
+        ret.gauge = chars_to_double(string, string_length);
+        DEBUG("snmp plugin: host %s: csnmp_value_list_to_value: Parsed string "
+              "as %s: %s",
               (host_name != NULL) ? host_name : "UNKNOWN",
               DS_TYPE_TO_STRING(type), string);
       }
@@ -910,7 +969,7 @@ static value_t csnmp_value_list_to_value(struct variable_list *vl, int type,
         break;
 
       case DS_TYPE_GAUGE:
-        ret.gauge = NAN;
+        //ret.gauge = NAN;
         break;
 
       default:
@@ -1357,17 +1416,12 @@ static int csnmp_read_table(host_definition_t *host, data_definition_t *data) {
     if (oid_list_todo_num == 0) {
       /* The request is still empty - so we are finished */
       DEBUG("snmp plugin: all variables have left their subtree");
-      snmp_free_pdu(req);
       status = 0;
       break;
     }
 
     res = NULL;
     status = snmp_sess_synch_response(host->sess_handle, req, &res);
-
-    /* snmp_sess_synch_response always frees our req PDU */
-    req = NULL;
-
     if ((status != STAT_SUCCESS) || (res == NULL)) {
       char *errstr = NULL;
 
@@ -1381,6 +1435,8 @@ static int csnmp_read_table(host_definition_t *host, data_definition_t *data) {
         snmp_free_pdu(res);
       res = NULL;
 
+      /* snmp_synch_response already freed our PDU */
+      req = NULL;
       sfree(errstr);
       csnmp_host_close_session(host);
 
@@ -1403,12 +1459,8 @@ static int csnmp_read_table(host_definition_t *host, data_definition_t *data) {
     for (vb = res->variables, i = 0; (vb != NULL);
          vb = vb->next_variable, i++) {
       /* Calculate value index from todo list */
-      while ((i < oid_list_len) && !oid_list_todo[i]) {
+      while ((i < oid_list_len) && !oid_list_todo[i])
         i++;
-      }
-      if (i >= oid_list_len) {
-        break;
-      }
 
       /* An instance is configured and the res variable we process is the
        * instance value (last index) */
@@ -1498,6 +1550,10 @@ static int csnmp_read_table(host_definition_t *host, data_definition_t *data) {
   if (res != NULL)
     snmp_free_pdu(res);
   res = NULL;
+
+  if (req != NULL)
+    snmp_free_pdu(req);
+  req = NULL;
 
   if (status == 0)
     csnmp_dispatch_table(host, data, instance_list_head, value_list_head);
